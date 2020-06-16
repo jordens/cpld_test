@@ -2,7 +2,7 @@ from migen import *
 
 
 # increment this if the behavior (LEDs, registers, EEM pins) changes
-__proto_rev__ = 8
+__proto_rev__ = 9
 
 
 class SR(Module):
@@ -36,14 +36,6 @@ class SR(Module):
 
         sr = Signal(width)
 
-        self.clock_domains.cd_le = ClockDomain("le", reset_less=True)
-        # clock the latch domain from selection deassertion but only after
-        # there was a serial clock edge with asserted select (i.e. ignore
-        # glitches).
-        self.specials += Instance("FDPE", p_INIT=1,
-                i_D=0, i_C=ClockSignal("sck1"), i_CE=self.sel, i_PRE=~self.sel,
-                o_Q=self.cd_le.clk)
-
         self.sync.sck0 += [
                 If(self.sel,
                     self.sdo.eq(sr[-1]),
@@ -53,15 +45,56 @@ class SR(Module):
         self.sync.sck1 += [
                 If(self.sel,
                     sr[0].eq(self.sdi),
-                    If(self.cd_le.clk,
+                    If(ClockSignal("le"),
                         sr[1:].eq(self.do[:-1])
                     ).Else(
                         sr[1:].eq(sr[:-1])
                     )
                 )
         ]
-        self.sync.le += [
-                self.di.eq(sr)
+        self.sync.le += self.di.eq(sr)
+
+
+class SISO(Module):
+    """
+    Serial-in serial-out shift register, SPI slave
+
+    * CPOL = 0 (clock idle low)
+    * CPHA = 0 (sample on first edge, shift on second)
+    * SPI mode 0
+    * samples SDI on rising clock edges (SCK1 domain)
+    * shifts out SDO on falling clock edges (SCK0 domain)
+    * FIFO
+    * LOAD: parallel data do is loaded into the shift
+        register at the first rising SCK1 edge. In this
+        mode, the first (MSB) at the output is undefined.
+    """
+    def __init__(self, width):
+        self.sdi = Signal()
+        self.sdo = Signal()
+        self.sel = Signal()
+
+        self.load = Signal()
+        self.do = Signal(width - 1)
+
+        # # #
+
+        sr = Signal(width)
+
+        self.sync.sck0 += [
+                If(self.sel,
+                    self.sdo.eq(sr[-1])
+                )
+        ]
+        self.sync.sck1 += [
+                If(self.sel,
+                    sr[0].eq(self.sdi),
+                    If(self.load & ClockSignal("le"),
+                        sr[1:].eq(self.do),
+                    ).Else(
+                        sr[1:].eq(sr[:-1]),
+                    )
+                )
         ]
 
 
@@ -78,7 +111,7 @@ class CFG(Module):
     | RF_SW     | 4     | Activates RF switch per channel                 |
     | LED       | 4     | Activates the red LED per channel               |
     | PROFILE   | 3     | Controls DDS[0:3].PROFILE[0:2]                  |
-    | DUMMY     | 1     | Reserved (used in a previous revision)          |
+    | EN_RB     | 1     | Enable half-duplex SPI readback in EN_NU mode   |
     | IO_UPDATE | 1     | Asserts DDS[0:3].IO_UPDATE where CFG.MASK_NU    |
     |           |       | is high                                         |
     | MASK_NU   | 4     | Disables DDS from QSPI interface, disables      |
@@ -102,7 +135,7 @@ class CFG(Module):
 
             ("profile", 3),
 
-            ("dummy", 1),
+            ("en_rb", 1),
             ("io_update", 1),
 
             ("mask_nu", 4),
@@ -277,6 +310,33 @@ class Urukul(Module):
 
     See :class:`Urukul` and :class:`SR`
 
+    SPI readback inside of EN_NU
+    ---
+
+    With EN_NU, MISO is unavailable. To perform read transactions in this mode,
+    half-duplex SPI mode can be enabled by setting the EN_RB bit in CFG.
+    Once set, the CPLD expects an alternating sequence of two SPI transactions:
+        * RB_STATE = 0: One "read" transaction of any length from any device
+            (CS=1-3). The return data's least significant bits will be
+            stored in the SISO shift register.
+
+        * RB_STATE = 1: One read transaction in half-duplex SPI mode shifting
+            out data from the SISO over MOSI. Depending on the chip selected,
+            data can be loaded into the SISO at the first SPI clock edge in this
+            state, overwriting the data that was previously inserted.
+
+            |  CS | data returned from SISO with EN_RB in RB_STATE = 1     |
+            |-----+--------------------------------------------------------|
+            |  1  | LSBs of PROTO_REV                                      |
+            |  2  | LSBs of PLL_LOCK                                       |
+            |  3  | LSBs of data that would have been returned during      |
+            |     | RB_STATE = 0 via MISO if the CPLD had not been in      |
+            |     | EN_NU mode.                                            |
+
+        To end this protocol, the RB_EN flag can be reset during RB_STATE = 0.
+
+    See :class:`SISO` and :class:`CFG`
+
     CFG
     ---
 
@@ -413,6 +473,7 @@ class Urukul(Module):
         self.clock_domains.cd_sys = ClockDomain("sys", reset_less=True)
         self.clock_domains.cd_sck0 = ClockDomain("sck0", reset_less=True)
         self.clock_domains.cd_sck1 = ClockDomain("sck1", reset_less=True)
+        self.clock_domains.cd_le = ClockDomain("le", reset_less=True)
 
         platform.add_period_constraint(eem[0]._pin, 8.)
         platform.add_period_constraint(eem[2]._pin, 8.)
@@ -424,13 +485,15 @@ class Urukul(Module):
         en_9910 = Signal()  # AD9910 populated (instead of AD9912)
         en_nu = Signal()  # NU-Servo operation with quad SPI
         en_eem1 = Signal()  # EEM1 connected and sync outputs used
+        en_rb = Signal() # Enable readback over MOSI line
 
         self.comb += [
                 fsen.eq(1),
                 en_9910.eq(ifc_mode[0] | variant),
                 en_nu.eq(ifc_mode[1]),
                 en_eem1.eq(ifc_mode[2]),
-                [eem[i].oe.eq(0) for i in range(12) if i not in (2, 10)],
+                [eem[i].oe.eq(0) for i in range(12) if i not in (1, 2, 10)],
+                eem[1].oe.eq(en_rb),
                 eem[2].oe.eq(~en_nu),
                 eem[10].oe.eq(~en_nu & en_eem1),
                 eem[10].o.eq(eem[6].i),
@@ -442,31 +505,59 @@ class Urukul(Module):
         cfg = CFG(platform)
         stat = Status(platform)
         sr = SR(24)
+        siso = SISO(8)
         assert len(cfg.data) <= len(sr.di)
         assert len(stat.data) <= len(sr.do)
-        self.submodules += cfg, stat, sr
+        self.submodules += cfg, stat, sr, siso
 
-        sel = Signal(8)
+        rb_state = Signal(reset_less=True)
+        sel_any = Signal()
         cs = Signal(3)
         miso = Signal(8)
         mosi = eem[1].i
 
-        self.specials += Instance("FDPE", p_INIT=1,
-                i_D=0, i_C=ClockSignal("sck1"), i_CE=sel[2], i_PRE=~sel[2],
-                o_Q=att.le)
+        self.specials += [
+                Instance("FDPE", p_INIT=1,
+                    i_D=0, i_C=ClockSignal("sck1"), i_CE=((cs==2) & ~en_rb),
+                    i_PRE=~((cs==2) & ~en_rb), o_Q=att.le),
+                # clock the latch domain from selection deassertion
+                # but only after there was a serial clock edge with
+                # any asserted select (i.e. ignore glitches).
+                Instance("FDPE", p_INIT=1,
+                    i_D=0, i_C=ClockSignal("sck1"), i_CE=sel_any,
+                    i_PRE=~sel_any, o_Q=self.cd_le.clk),
+        ]
+
+        self.sync.le += [
+                If(cfg.data.en_rb & en_nu,
+                    rb_state.eq(~rb_state)
+                ).Else(
+                    rb_state.eq(0)
+                )
+        ]
 
         self.comb += [
                 cfg.en_9910.eq(en_9910),
                 cs.eq(Cat(eem[3].i, eem[4].i, ~en_nu & eem[5].i)),
-                Array(sel)[cs].eq(1),  # one-hot
                 eem[2].o.eq(Array(miso)[cs]),
-                miso[3].eq(miso[4]),  # for all-DDS take DDS0:MISO
+                sel_any.eq(~(cs==0)),
 
-                att.clk.eq(sel[2] & self.cd_sck1.clk),
-                att.s_in.eq(mosi),
-                miso[2].eq(att.s_out),
+                siso.sel.eq(sel_any),
+                siso.sdi.eq(eem[2].o),
+                eem[1].o.eq(siso.sdo),
+                siso.do.eq(Mux(cs==2, stat.data.pll_lock, stat.data.proto_rev)),
+                siso.load.eq(((cs==1) | (cs==2)) & en_rb),
+                en_rb.eq(cfg.data.en_rb & sel_any & rb_state),
 
-                sr.sel.eq(sel[1]),
+                miso[3].eq(Mux(~en_nu, miso[4],
+                    Mux(cfg.data.mask_nu[3], miso[7],
+                        Mux(cfg.data.mask_nu[2], miso[6],
+                            Mux(cfg.data.mask_nu[1], miso[5], miso[4]))))),
+
+                att.clk.eq((cs==2) & ~en_rb & self.cd_sck1.clk),
+                Cat(att.s_in, miso[2]).eq(Cat(mosi, att.s_out)),
+
+                sr.sel.eq((cs==1) & ~en_rb),
                 sr.sdi.eq(mosi),
                 miso[1].eq(sr.sdo),
 
@@ -485,7 +576,7 @@ class Urukul(Module):
             sel_spi = Signal()
             sel_nu = Signal()
             self.comb += [
-                    sel_spi.eq(sel[i + 4] | (sel[3] & cfg.data.mask_nu[i])),
+                    sel_spi.eq((cs==(i+4)) | ((cs==3) & ~en_rb & cfg.data.mask_nu[i])),
                     sel_nu.eq(en_nu & ~cfg.data.mask_nu[i]),
                     ddsi.cs_n.eq(~Mux(sel_nu, eem[5].i, sel_spi)),
                     ddsi.sck.eq(Mux(sel_nu, eem[2].i, self.cd_sck1.clk)),
@@ -495,9 +586,3 @@ class Urukul(Module):
                         cfg.data.io_update, eem[6].i)),
             ]
 
-        tp = [platform.request("tp", i) for i in range(3)]
-        self.comb += [
-                tp[0].eq(dds[0].cs_n),
-                tp[1].eq(dds[0].sck),
-                tp[2].eq(dds[0].sdi)
-        ]
